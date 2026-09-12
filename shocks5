@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+SOCKS5 Proxy - Production Grade (Fixed)
+- recv_exact() untuk semua reads (anti-fragmentasi)
+- Batas maksimum koneksi simultan
+- Rate limiting per IP (anti-scanner/abuse)
+- Log rotation otomatis
+- Graceful shutdown via SIGTERM/SIGINT
+- Auto-restart jika server crash
+- FIX: idle timeout per koneksi (cegah zombie connection menghabiskan slot)
+- FIX: TCP keepalive lebih agresif (deteksi koneksi mati lebih cepat)
+- FIX: timeout kirim data dipisah dari timeout baca, agar transfer lambat
+       tidak diputus paksa
+"""
+
+import socket
+import threading
+import sys
+import time
+import signal
+import logging
+import traceback
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict
+
+# ─── KONFIGURASI ────────────────────────────────────────────────
+PORT          = int(sys.argv[1]) if len(sys.argv) > 1 else 28352
+BIND_ADDR     = '0.0.0.0'
+CONNECT_TIMEOUT   = 10       # detik timeout saat connect ke target
+MAX_CONNECTIONS   = 200      # maks koneksi simultan
+BACKLOG           = 100      # antrian accept()
+
+# FIX: idle timeout — koneksi yang tidak ada trafik sama sekali
+# selama N detik akan ditutup paksa, supaya tidak jadi zombie
+IDLE_TIMEOUT      = 900      # 15 menit tanpa data sama sekali → tutup
+
+# Rate limiting: max N koneksi baru per IP dalam window W detik
+RATE_LIMIT_COUNT  = 20
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_BLOCK  = 300
+
+# Log
+LOG_FILE      = '/tmp/socks.log'
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+# Interval log status koneksi aktif (untuk monitoring, lihat apakah
+# jumlah koneksi terus naik = tanda kebocoran)
+STATUS_LOG_INTERVAL = 300    # tiap 5 menit
+# ────────────────────────────────────────────────────────────────
+
+
+def setup_logger():
+    logger = logging.getLogger('socks5')
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter('[%(asctime)s] %(levelname)s %(message)s',
+                            datefmt='%Y-%m-%d %H:%M:%S')
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES,
+                             backupCount=LOG_BACKUP_COUNT)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+log = setup_logger()
+
+_shutdown       = threading.Event()
+_conn_semaphore = threading.Semaphore(MAX_CONNECTIONS)
+_active_conns   = 0
+_active_lock    = threading.Lock()
+
+_rate_data      = defaultdict(list)
+_rate_lock      = threading.Lock()
+_blocked_ips    = {}
+_blocked_lock   = threading.Lock()
+
+
+def recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(f"connection closed (need {n}, got {len(buf)})")
+        buf += chunk
+    return buf
+
+
+def set_keepalive(sock):
+    """FIX: keepalive lebih agresif supaya koneksi mati terdeteksi
+    lebih cepat daripada default Linux (2 jam)."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
+    except (AttributeError, OSError):
+        pass  # tidak semua platform dukung opsi ini
+
+
+def is_rate_limited(ip):
+    now = time.time()
+    with _blocked_lock:
+        if ip in _blocked_ips:
+            if now < _blocked_ips[ip]:
+                return True
+            else:
+                del _blocked_ips[ip]
+
+    with _rate_lock:
+        timestamps = _rate_data[ip]
+        timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+        timestamps.append(now)
+        _rate_data[ip] = timestamps
+
+        if len(timestamps) > RATE_LIMIT_COUNT:
+            with _blocked_lock:
+                _blocked_ips[ip] = now + RATE_LIMIT_BLOCK
+            log.warning(f"Rate limit: {ip} diblokir selama {RATE_LIMIT_BLOCK}s "
+                        f"({len(timestamps)} koneksi dalam {RATE_LIMIT_WINDOW}s)")
+            return True
+    return False
+
+
+def cleanup_rate_data():
+    """Bersihkan data rate lama + log status koneksi aktif secara berkala."""
+    last_status_log = time.time()
+    while not _shutdown.is_set():
+        _shutdown.wait(60)
+        now = time.time()
+        with _rate_lock:
+            for ip in list(_rate_data.keys()):
+                _rate_data[ip] = [t for t in _rate_data[ip]
+                                  if now - t < RATE_LIMIT_WINDOW]
+                if not _rate_data[ip]:
+                    del _rate_data[ip]
+        with _blocked_lock:
+            for ip in list(_blocked_ips.keys()):
+                if now >= _blocked_ips[ip]:
+                    del _blocked_ips[ip]
+
+        if now - last_status_log >= STATUS_LOG_INTERVAL:
+            with _active_lock:
+                log.info(f"Status: {_active_conns}/{MAX_CONNECTIONS} koneksi aktif")
+            last_status_log = now
+
+
+def pipe(src, dst, activity, label=''):
+    """Forward data satu arah. FIX: update timestamp aktivitas tiap
+    kali ada data, supaya watchdog idle timeout bisa jalan."""
+    try:
+        while not _shutdown.is_set():
+            src.settimeout(1.0)
+            try:
+                data = src.recv(4096)
+            except socket.timeout:
+                # FIX: cek idle timeout di sini, bukan cuma nunggu shutdown
+                if time.time() - activity[0] > IDLE_TIMEOUT:
+                    log.debug(f"Idle timeout ({IDLE_TIMEOUT}s), tutup koneksi")
+                    break
+                continue
+            if not data:
+                break
+            activity[0] = time.time()   # FIX: catat aktivitas
+            try:
+                dst.settimeout(30)      # FIX: timeout kirim dipisah, lebih longgar
+                dst.sendall(data)
+            except socket.timeout:
+                log.debug("Timeout saat mengirim data (tujuan lambat/macet)")
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+
+def handle_client(client, addr):
+    global _active_conns
+    ip = addr[0]
+    remote = None
+
+    if not _conn_semaphore.acquire(blocking=False):
+        log.warning(f"Tolak {ip}: maks koneksi ({MAX_CONNECTIONS}) tercapai")
+        client.close()
+        return
+
+    with _active_lock:
+        _active_conns += 1
+
+    try:
+        client.settimeout(CONNECT_TIMEOUT)
+
+        header = recv_exact(client, 2)
+        ver, nmethods = header
+        if ver != 5:
+            log.debug(f"Tolak {ip}: bukan SOCKS5 (ver={ver})")
+            return
+
+        recv_exact(client, nmethods)
+        client.sendall(b'\x05\x00')
+
+        req = recv_exact(client, 4)
+        ver, cmd, rsv, atyp = req
+
+        if cmd != 1:
+            client.sendall(b'\x05\x07\x00\x01' + b'\x00' * 6)
+            return
+
+        if atyp == 1:
+            target_addr = socket.inet_ntoa(recv_exact(client, 4))
+        elif atyp == 3:
+            dlen = recv_exact(client, 1)[0]
+            target_addr = recv_exact(client, dlen).decode(errors='replace')
+        elif atyp == 4:
+            raw = recv_exact(client, 16)
+            target_addr = socket.inet_ntop(socket.AF_INET6, raw)
+        else:
+            client.sendall(b'\x05\x08\x00\x01' + b'\x00' * 6)
+            return
+
+        target_port = int.from_bytes(recv_exact(client, 2), 'big')
+
+        try:
+            family = socket.AF_INET6 if atyp == 4 else socket.AF_INET
+            remote = socket.socket(family, socket.SOCK_STREAM)
+            remote.settimeout(CONNECT_TIMEOUT)
+            remote.connect((target_addr, target_port))
+            remote.settimeout(None)
+        except Exception as e:
+            log.debug(f"Gagal connect ke {target_addr}:{target_port} dari {ip}: {e}")
+            client.sendall(b'\x05\x05\x00\x01' + b'\x00' * 6)
+            return
+
+        set_keepalive(client)   # FIX: keepalive agresif
+        set_keepalive(remote)
+
+        client.sendall(b'\x05\x00\x00\x01' +
+                       socket.inet_aton('0.0.0.0') +
+                       (0).to_bytes(2, 'big'))
+        client.settimeout(None)
+
+        activity = [time.time()]   # FIX: shared timestamp antar 2 thread
+        t1 = threading.Thread(target=pipe, args=(client, remote, activity), daemon=True)
+        t2 = threading.Thread(target=pipe, args=(remote, client, activity), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+    except Exception as e:
+        log.debug(f"handle_client error ({ip}): {e}")
+    finally:
+        for s in (client, remote):
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        _conn_semaphore.release()
+        with _active_lock:
+            _active_conns -= 1
+
+
+def run_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((BIND_ADDR, PORT))
+    server.listen(BACKLOG)
+    server.settimeout(1.0)
+    log.info(f"SOCKS5 proxy jalan di {BIND_ADDR}:{PORT} "
+             f"(maks {MAX_CONNECTIONS} koneksi, idle timeout {IDLE_TIMEOUT}s, "
+             f"rate limit {RATE_LIMIT_COUNT}/{RATE_LIMIT_WINDOW}s per IP)")
+
+    cleaner = threading.Thread(target=cleanup_rate_data, daemon=True)
+    cleaner.start()
+
+    try:
+        while not _shutdown.is_set():
+            try:
+                client, addr = server.accept()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not _shutdown.is_set():
+                    log.error(f"Accept error: {e}")
+                    time.sleep(1)
+                continue
+
+            ip = addr[0]
+            if is_rate_limited(ip):
+                client.close()
+                continue
+
+            t = threading.Thread(target=handle_client, args=(client, addr),
+                                 daemon=True)
+            t.start()
+    finally:
+        server.close()
+        log.info("Server berhenti.")
+
+
+def main():
+    def handle_signal(sig, frame):
+        log.info(f"Sinyal {sig} diterima, shutdown...")
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT,  handle_signal)
+
+    while not _shutdown.is_set():
+        try:
+            run_server()
+        except Exception as e:
+            if not _shutdown.is_set():
+                log.error(f"Fatal error, restart dalam 3 detik: {e}")
+                log.error(traceback.format_exc())
+                time.sleep(3)
+
+    log.info("Proxy selesai.")
+
+
+if __name__ == '__main__':
+    main()
