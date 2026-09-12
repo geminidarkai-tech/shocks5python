@@ -22,8 +22,15 @@ PORT="${2:-28352}"
 PROXY_BIN="/usr/local/bin/socksproxy.py"
 SERVICE_NAME="socksproxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+INIT_SCRIPT="/etc/init.d/${SERVICE_NAME}"
 LOG_FILE="/tmp/socks.log"
 SYMLINK="/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
+
+# Deteksi init system otomatis
+HAS_SYSTEMD=0
+if command -v systemctl &>/dev/null && [ -d /etc/systemd/system ]; then
+    HAS_SYSTEMD=1
+fi
 # ─────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -325,8 +332,9 @@ PYEOF
 
 # ══════════════════════════════════════════════════════════════════
 write_service() {
-info "Menulis systemd service ke $SERVICE_FILE ..."
-cat > "$SERVICE_FILE" << SVCEOF
+if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    info "Menulis systemd service ke $SERVICE_FILE ..."
+    cat > "$SERVICE_FILE" << SVCEOF
 [Unit]
 Description=SOCKS5 Proxy (port ${PORT})
 After=network.target
@@ -342,14 +350,92 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 SVCEOF
+else
+    info "Systemd tidak ada — menulis SysV init script ke $INIT_SCRIPT ..."
+    # Cari python3 yang tersedia
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "/usr/bin/python")
+    cat > "$INIT_SCRIPT" << INITEOF
+#!/bin/bash
+# chkconfig: 2345 90 10
+# description: SOCKS5 Proxy (port ${PORT})
+PROXY_BIN="${PROXY_BIN}"
+PYTHON="${PYTHON_BIN}"
+PORT="${PORT}"
+LOG="${LOG_FILE}"
+PIDFILE="/var/run/${SERVICE_NAME}.pid"
+
+start() {
+    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+        echo "socksproxy sudah jalan (PID \$(cat \$PIDFILE))"
+        return 0
+    fi
+    echo -n "Menjalankan socksproxy..."
+    nohup \$PYTHON \$PROXY_BIN \$PORT >> \$LOG 2>&1 &
+    echo \$! > "\$PIDFILE"
+    sleep 1
+    if kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+        echo " OK (PID \$(cat \$PIDFILE))"
+    else
+        echo " GAGAL — cek \$LOG"
+        rm -f "\$PIDFILE"
+        return 1
+    fi
+}
+
+stop() {
+    echo -n "Menghentikan socksproxy..."
+    if [ -f "\$PIDFILE" ]; then
+        kill \$(cat "\$PIDFILE") 2>/dev/null && rm -f "\$PIDFILE"
+    fi
+    pkill -f "socksproxy.py" 2>/dev/null || true
+    echo " OK"
+}
+
+status() {
+    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+        echo "socksproxy jalan (PID \$(cat \$PIDFILE))"
+    else
+        echo "socksproxy tidak jalan"
+        return 1
+    fi
+}
+
+case "\$1" in
+    start)   start  ;;
+    stop)    stop   ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *)       echo "Usage: \$0 {start|stop|restart|status}" ;;
+esac
+INITEOF
+    chmod +x "$INIT_SCRIPT"
+fi
 }
 
 # ══════════════════════════════════════════════════════════════════
 enable_service() {
+if [ "$HAS_SYSTEMD" -eq 1 ]; then
     # Pakai symlink manual karena systemctl enable bisa gagal kalau polkit/dbus error
-    info "Mengaktifkan service saat boot (symlink manual) ..."
+    info "Mengaktifkan service saat boot (systemd symlink) ..."
     mkdir -p "$(dirname "$SYMLINK")"
     ln -sf "$SERVICE_FILE" "$SYMLINK"
+else
+    info "Mengaktifkan service saat boot (SysV chkconfig) ..."
+    if command -v chkconfig &>/dev/null; then
+        chkconfig --add "$SERVICE_NAME" 2>/dev/null || true
+        chkconfig "$SERVICE_NAME" on 2>/dev/null || true
+    fi
+    # Fallback: tambah ke rc.local juga supaya pasti jalan
+    RC_LOCAL="/etc/rc.local"
+    [ -f "$RC_LOCAL" ] || RC_LOCAL="/etc/rc.d/rc.local"
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "/usr/bin/python")
+    if ! grep -q "socksproxy" "$RC_LOCAL" 2>/dev/null; then
+        sed -i 's|^exit 0||' "$RC_LOCAL" 2>/dev/null || true
+        echo "nohup ${PYTHON_BIN} ${PROXY_BIN} ${PORT} >> ${LOG_FILE} 2>&1 &" >> "$RC_LOCAL"
+        echo "exit 0" >> "$RC_LOCAL"
+        info "Ditambahkan ke $RC_LOCAL sebagai fallback"
+    fi
+fi
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -379,11 +465,15 @@ start_proxy() {
     pkill -f "socksproxy.py" 2>/dev/null || true
     sleep 1
 
-    if systemctl start "$SERVICE_NAME" 2>/dev/null; then
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "/usr/bin/python")
+
+    if [ "$HAS_SYSTEMD" -eq 1 ] && systemctl start "$SERVICE_NAME" 2>/dev/null; then
         info "Service dimulai via systemctl"
+    elif [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" start 2>/dev/null; then
+        info "Service dimulai via SysV init script"
     else
-        warn "systemctl start gagal — fallback ke nohup ..."
-        nohup python3 "$PROXY_BIN" "$PORT" >> "$LOG_FILE" 2>&1 &
+        warn "Fallback ke nohup ..."
+        nohup "$PYTHON_BIN" "$PROXY_BIN" "$PORT" >> "$LOG_FILE" 2>&1 &
         sleep 1
         if pgrep -f "socksproxy.py" > /dev/null; then
             info "Proxy berjalan via nohup (PID: $(pgrep -f socksproxy.py))"
@@ -435,21 +525,28 @@ start)
 stop)
     need_root
     info "Menghentikan proxy ..."
-    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    [ "$HAS_SYSTEMD" -eq 1 ] && systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop 2>/dev/null || true
     pkill -f "socksproxy.py" 2>/dev/null || true
     info "Proxy dihentikan."
     ;;
 
 status)
     echo ""
-    echo "── Systemd service ──────────────────────────────────"
-    systemctl status "$SERVICE_NAME" 2>/dev/null || echo "(tidak ada service)"
+    if [ "$HAS_SYSTEMD" -eq 1 ]; then
+        echo "── Systemd service ──────────────────────────────────"
+        systemctl status "$SERVICE_NAME" 2>/dev/null || echo "(tidak ada service)"
+    elif [ -x "$INIT_SCRIPT" ]; then
+        echo "── SysV init service ────────────────────────────────"
+        "$INIT_SCRIPT" status 2>/dev/null || echo "(tidak jalan)"
+    fi
     echo ""
     echo "── Proses aktif ─────────────────────────────────────"
     pgrep -a -f socksproxy.py 2>/dev/null || echo "(tidak ada proses)"
     echo ""
     echo "── Koneksi di port $PORT ──────────────────────────────"
-    ss -tnp | grep ":$PORT" || echo "(tidak ada)"
+    ss -tnp 2>/dev/null | grep ":$PORT" || \
+      netstat -tnp 2>/dev/null | grep ":$PORT" || echo "(tidak ada)"
     echo ""
     echo "── Log terakhir ─────────────────────────────────────"
     tail -20 "$LOG_FILE" 2>/dev/null || echo "(log kosong)"
@@ -462,12 +559,21 @@ log)
 uninstall)
     need_root
     info "Menghapus SOCKS5 Proxy ..."
-    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    [ "$HAS_SYSTEMD" -eq 1 ] && systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop 2>/dev/null || true
     pkill -f "socksproxy.py" 2>/dev/null || true
-    rm -f "$PROXY_BIN" "$SERVICE_FILE" "$SYMLINK"
+    # Hapus SysV dari chkconfig
+    command -v chkconfig &>/dev/null && chkconfig "$SERVICE_NAME" off 2>/dev/null || true
+    # Hapus dari rc.local
+    for RC in /etc/rc.local /etc/rc.d/rc.local; do
+        [ -f "$RC" ] && sed -i '/socksproxy/d' "$RC"
+    done
+    # Hapus files
+    rm -f "$PROXY_BIN" "$SERVICE_FILE" "$SYMLINK" "$INIT_SCRIPT"
     # Hapus rule iptables
     iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-    service iptables save 2>/dev/null || iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+    service iptables save 2>/dev/null || \
+      iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
     info "Uninstall selesai."
     ;;
 
